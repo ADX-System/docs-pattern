@@ -76,7 +76,7 @@ def load(docs):
         for f in sorted((docs / kind).glob("*.md")):
             if re.fullmatch(rf"{PREFIX[kind]}\d{{3}}", f.stem):
                 add(f.stem, kind, f)
-            elif not (kind == "rules" and f.name == "_ltm.md"):   # _ltm.md = 메모를 고르는 질의, 페이지 아님
+            elif not (kind == "rules" and f.name in ("_ltm.md", "_retired.md")):   # 질의 · 장부, 페이지 아님
                 fails.append(f"{f.relative_to(docs).as_posix()}: 파일 이름은 {PREFIX[kind]}NNN.md")
     for f in sorted((docs / "documentation").rglob("*.md")):
         add(f.relative_to(docs / "documentation").with_suffix("").as_posix(), "doc", f)
@@ -166,10 +166,46 @@ def validate(docs, pages):
                 miss = [h for h in RULE_LABELS[t] if f"**{h}" not in p["body"]]
                 if miss:
                     warns.append(f"{p['rel']}: {t} 틀의 소제목 없음 — " + ", ".join(f"**{h}:**" for h in miss))
+    fails += retired_check(docs, pages)
     inbox = docs / "_inbox"
     if inbox.is_dir() and any(inbox.iterdir()):
         warns.append("_inbox/ 에 처리하지 않은 변경 요청이 있음")
     return fails, warns, {k: sorted(v) for k, v in back.items()}
+
+
+def retired(docs):
+    """rules/_retired.md = 결정으로 뺀 개념의 장부. 표 한 행 = | 용어 | 뺀 날 | 근거 | 대신 | 남아도 되는 페이지(쉼표) |
+    -> [(용어, 날짜, 근거, 대신, {허용 rel})], 장부 형식 FAIL"""
+    f = docs / "rules" / "_retired.md"
+    if not f.exists():
+        return [], []
+    rows, fails = [], []
+    for line in f.read_text(encoding="utf-8").splitlines():
+        cells = [c.strip() for c in re.split(r"(?<!\\)\|", line.strip())[1:-1]]
+        if len(cells) < 4 or cells[0] in ("용어", "") or set(cells[0]) <= set("-: "):
+            continue
+        term = cells[0].strip("`")
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", cells[1]) or not cells[2]:
+            fails.append(f"rules/_retired.md: '{term}' 행에 뺀 날(YYYY-MM-DD)과 근거가 필요")
+        allow = {a.strip() for a in (cells[4] if len(cells) > 4 else "").split(",") if a.strip()}
+        rows.append((term, cells[1], cells[2], cells[3], allow))
+    return rows, fails
+
+
+def retired_check(docs, pages):
+    """지금 참인 페이지(Document · 규칙 · 진행 중 단계)에 장부의 용어가 남으면 FAIL. history · 이슈 · 지난 단계는 기록이라 보지 않는다."""
+    rows, fails = retired(docs)
+    for p in pages.values():
+        if not (p["kind"] in ("doc", "rules") or (p["kind"] == "state" and p["status"] == "active")):
+            continue
+        for term, date, why, instead, allow in rows:
+            if p["rel"] in allow:
+                continue
+            for n, line in enumerate(p["body"].splitlines(), 1):
+                if term in line:
+                    fails.append(f"{p['rel']}: 뺀 개념 '{term}'({date} {why}, 대신 {instead or '없음'}) 이 남아 있음 — 본문 {n}줄")
+                    break
+    return fails
 
 
 def doc_order(pages):
@@ -316,6 +352,10 @@ def selftest():
         ("파일 이름은", lambda r: w(r, "issues/I001-slug.md", "---\ntitle: x\nstatus: open\n---\n")),
         ("파일 이름은 RNNN", lambda r: w(r, "rules/save-all.md", "---\ntitle: x\n---\n")),
         ("rules/R001.md: frontmatter title", lambda r: w(r, "rules/R001.md", "---\n---\n")),
+        ("뺀 개념 '옛구조'", lambda r: (w(r, "rules/_retired.md", "| 용어 | 뺀 날 | 근거 | 대신 | 남아도 되는 페이지 |\n|---|---|---|---|---|\n"
+                                                         "| 옛구조 | 2026-09-03 | [[I001]] | 구조 | documentation/arch.md |\n"),
+                                      w(r, "documentation/arch/redirect.md", "---\ntitle: 리다이렉트\nsummary: x\n---\n옛구조 를 따른다."))),
+        ("뺀 날(YYYY-MM-DD)", lambda r: w(r, "rules/_retired.md", "| 옛구조 | 어제 | | 구조 | |\n")),
     ]
     with tempfile.TemporaryDirectory() as tmp:
         base = Path(tmp) / "base"
@@ -363,6 +403,14 @@ def selftest():
         w(orphan, "issues/I002.md", "---\ntitle: 외톨이\nstatus: open\n---\n")
         w(orphan, "history/issues/I002.md", "- 2026-09-03 만듦 — x")
         assert any("링크하지 않는 이슈" in m for m in run(orphan, quiet=True)[1]), "외톨이 이슈 경고 미발화"
+        ok = Path(tmp) / "retired-ok"   # 허용 페이지 · history · 이슈 · 지난 단계에 남은 것은 FAIL 이 아니다
+        shutil.copytree(base, ok)
+        w(ok, "rules/_retired.md", "| 옛구조 | 2026-09-03 | [[I001]] | 구조 | documentation/arch.md |\n")
+        w(ok, "documentation/arch.md", "---\ntitle: 구조\nsummary: 구조 한 줄\n---\n# 개요\n옛구조 는 코어에 두지 않는다.")
+        w(ok, "issues/I001.md", "---\ntitle: x\nstatus: open\n---\n옛구조 를 뺐다 [[S002]].")
+        w(ok, "state/S001.md", "---\ntitle: 이관\nstatus: done\n---\n옛구조 이관.")
+        w(ok, "history/documentation/arch.md", "- 2026-09-03 옛구조 제거 — [[I001]]")
+        assert not run(ok, quiet=True)[0], ("허용된 곳을 잡음", run(ok, quiet=True)[0])
         ltm = Path(tmp) / "ltm"
         shutil.copytree(base, ltm)
         w(ltm, "rules/_ltm.md", "---\narea: [없는태그zz]\n---\n")

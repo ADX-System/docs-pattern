@@ -64,7 +64,7 @@ Every Python script except `status_check.py` has a `--selftest`.
 ## Install
 
 ```bash
-git clone https://github.com/fbdeme/docs-pattern ~/workspace/docs-pattern
+git clone https://github.com/ADX-System/docs-pattern ~/workspace/docs-pattern
 ln -s ~/workspace/docs-pattern ~/.claude/skills/docs-pattern
 ```
 
