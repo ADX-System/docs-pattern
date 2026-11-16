@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 WORKSPACE = Path(os.environ.get("RULES_WORKSPACE", Path.home() / "workspace"))
@@ -52,7 +53,7 @@ def is_hub(p):
 
 
 def hub_projects():
-    return sorted(d for d in (HUB / "projects").glob("*/*") if d.is_dir() and not d.name.startswith(("_", ".")))   # . = 조직 폴더의 .git 등
+    return sorted(d for d in (HUB / "projects").glob("*/*") if d.is_dir() and is_hub(d))   # 조직 폴더의 _catalog · rules · .git 은 프로젝트가 아니다
 
 
 def hub_by_name(name):
@@ -239,13 +240,6 @@ def render(rules):
             out.append(f"# 조직 공통 Short Term Memory ({rules.parent.name})\n\n" + "\n\n".join(
                 f"## {p.stem} {(re.search(r'^title:\s*(.+)$', p.read_text(encoding='utf-8'), re.M) or [None, ''])[1]}\n"
                 + p.read_text(encoding="utf-8").split("\n---\n", 1)[-1].strip() for p in org))
-        if sum(map(len, ctx.values())) > docs_build.CONTEXT_LIMIT:   # 넘치는 칸은 본문 대신 위치 한 줄 (파일로 빠지지 않게)
-            for part, text in sorted(ctx.items(), key=lambda kv: -len(kv[1])):
-                if sum(map(len, ctx.values())) <= docs_build.CONTEXT_LIMIT:
-                    break
-                where = {"Agent State": "current_status.md", "Short Term Memory": "rules/", "Document": "documentation/",
-                         "Long Term Memory": "rules/_ltm.md"}[part]
-                ctx[part] = f"(상한 {docs_build.CONTEXT_LIMIT:,}자를 넘어 생략: {len(text):,}자 — `{rules / where}` 를 직접 읽는다. 줄이는 일 = docs_build WARN)"
         st = stores_of(rules)   # 데이터 저장소 한 줄씩 (구조 전문 = 조직 _catalog/<저장소>.json)
         if st:
             ctx["데이터 저장소"] = "\n".join(f"- {x['label']}" for x in st) + f"\n구조 전문 = {rules.parent / '_catalog'}/<저장소>.json"
@@ -264,6 +258,71 @@ def render(rules):
 
 
 LIMIT = 9500   # hook 출력 한 줄(문자열)이 10,000자를 넘으면 파일로 빠지고 앞 2,000자만 들어간다
+PARTS = 1      # 같은 훅을 몇 번 걸었나(--part k/n). 넣을 수 있는 전체 = LIMIT × PARTS
+SPOOL_WAIT = 5.0
+
+
+def chunks(text, size=LIMIT):
+    """글을 size 이하 조각으로 — 문단 경계에서, 문단이 크면 줄, 줄이 크면 글자에서 자른다"""
+    out, cur = [], ""
+    for para in text.split("\n\n"):
+        small = len(para) <= size
+        for piece in [para] if small else [ln[i:i + size] for ln in para.split("\n") for i in range(0, max(len(ln), 1), size)]:
+            sep = "\n\n" if small else "\n"
+            if cur and len(cur) + len(sep) + len(piece) > size:
+                out.append(cur)
+                cur = piece
+            else:
+                cur = cur + sep + piece if cur else piece
+    return out + [cur] if cur else out
+
+
+def wrap(text, ev):
+    return json.dumps({"hookSpecificOutput": {"hookEventName": ev, "additionalContext": text}}, ensure_ascii=False) if ev == "PreToolUse" else text
+
+
+def spool_of(raw):
+    return STATE / "spool" / (hashlib.sha256(raw.encode()).hexdigest()[:24] + ".json")
+
+
+def emit(raw, k, n):
+    """훅 출력 하나는 10,000자를 넘으면 파일로 빠진다 — 같은 훅을 n 번 걸고(--part k/n) 1번만 계산해 조각을 나눠 준다.
+    1번은 언제나 조각 목록(빈 것도)을 spool 에 쓴다: 나머지는 같은 입력(stdin) 해시로 그것을 기다렸다 제 조각을 낸다."""
+    ev = (json.loads(raw) if raw.strip() else {}).get("hook_event_name") or ""
+    if k > 1:
+        f, t = spool_of(raw), time.time() + SPOOL_WAIT
+        while not f.exists() and time.time() < t:
+            time.sleep(0.02)
+        if not f.exists():
+            with open(STATE / "spool.log", "a") as log:
+                log.write(f"{time.strftime('%F %T')} part {k}/{n} {ev}: 1번 조각을 {SPOOL_WAIT}s 안에 못 받음\n")
+            return
+        rest = json.loads(f.read_text())
+        if k - 2 < len(rest):
+            print(wrap(rest[k - 2], ev))
+        return
+    rest, res = [], None
+    try:
+        res = main(json.loads(raw))
+        if n > 1 and res and not (isinstance(res, dict) and ("hookSpecificOutput" not in res or "permissionDecision" in res["hookSpecificOutput"])):
+            cs = chunks(res if isinstance(res, str) else res["hookSpecificOutput"].get("additionalContext", ""))
+            if len(cs) > n:   # 훅 n 개로도 넘치면 마지막 조각 끝에 위치 한 줄
+                over = sum(map(len, cs[n:]))
+                cs = cs[:n - 1] + [cs[n - 1][:LIMIT - 300] + f"\n… 남은 {over:,}자는 훅 {n}개로도 넘쳐 뺐다 — `{ENTER_CMD} <이름>` 으로 부른다"]
+            cs = [c if i == 0 else f"[이어서 {i + 1}/{len(cs)}]\n{c}" for i, c in enumerate(cs)]
+            res, rest = wrap(cs[0], ev) if cs else None, cs[1:]
+    finally:
+        if n > 1:
+            sp = spool_of(raw)
+            sp.parent.mkdir(parents=True, exist_ok=True)
+            for old in sp.parent.glob("*.json"):   # 지난 사건의 조각은 5분 뒤 치운다
+                if time.time() - old.stat().st_mtime > 300:
+                    old.unlink(missing_ok=True)
+            tmp = sp.with_suffix(".tmp")
+            tmp.write_text(json.dumps(rest, ensure_ascii=False))
+            tmp.replace(sp)
+    if res:
+        print(res if isinstance(res, str) else json.dumps(res, ensure_ascii=False))
 
 
 def digest(text):
@@ -280,16 +339,21 @@ def fill(targets, seen, bound, used=0, why=""):
     out = []
     for d in targets:
         text = render(d)
-        if not text:
+        if not text:   # 넣을 것이 없는 폴더는 막을 이유도 없다
+            seen["loaded:" + str(d)] = True
             continue
         if seen.get(str(d)) == digest(text):
             out.append(titles(d))
-        elif used + len(text) > LIMIT:
-            out.append(f"[project {name_of(d)}] 본문 {len(text):,}자는 한 번에 넣을 한도를 넘어 뺐다 — `{ENTER_CMD} {name_of(d)}` 로 부른다")
-            seen[str(d)] = digest(text)   # 이 줄은 한 번만 — 내용이 다시 바뀌면 또 알린다
+        elif used + len(text) > LIMIT * PARTS:
+            # 본문은 못 넣어도 규칙 제목은 늘 넣는다. 본문이 안 들어갔으니 loaded 가 아니다 — 그 프로젝트 파일을 건드리는
+            # 도구 호출은 PreToolUse 가 `--enter` 전까지 막는다(gate)
+            out.append((titles(d) + "\n" if titles(d) else "") + f"[project {name_of(d)}] 본문 {len(text):,}자는 한 번에 넣을 한도를 넘어 뺐다"
+                       f" — 이 프로젝트 파일을 건드리기 전에 반드시 `{ENTER_CMD} {name_of(d)}` 를 Bash 로 실행한다(안 하면 도구 호출이 막힌다)")
+            add(bound, d)
         else:
             out.append(why + text)
             seen[str(d)] = digest(text)
+            seen["loaded:" + str(d)] = True
             add(bound, d)
         used += len(out[-1])
     return out
@@ -305,6 +369,18 @@ def touched(event):
     return paths
 
 
+def stop_gate(sid, event):
+    """Stop: 이 세션이 쓴 inbox 파일이 반영(삭제)되지 않고 남았으면 한 번 막는다 — inbox → 워커 → --check 까지가 한 일이다"""
+    log, warned = STATE / f"{sid}.inbox", STATE / f"{sid}.inbox_warned"
+    pending = sorted({p for p in (log.read_text().splitlines() if log.exists() else []) if p and Path(p).exists()})
+    if not pending or event.get("stop_hook_active") or (warned.exists() and warned.read_text() == "\n".join(pending)):
+        return None
+    warned.write_text("\n".join(pending))
+    return {"decision": "block", "reason": "이 세션이 프로젝트 _inbox/ 에 쓴 파일이 아직 반영되지 않았다:\n" + "\n".join(f"- {p}" for p in pending)
+            + "\n끝내기 전에 docs-pattern 워커로 페이지·history 에 반영하고 `docs_build.py <docs> --check` 0 FAIL 을 확인한다"
+            " (사용자가 미루라고 했으면 그렇다고 보고하고 끝낸다)."}
+
+
 def main(event):
     sid = re.sub(r"[^\w-]", "_", event.get("session_id") or "nosession")
     state_file, bind_file = STATE / f"{sid}.json", STATE / f"{sid}.bind"   # bind 는 SessionStart(compact)에도 지우지 않는다
@@ -317,23 +393,40 @@ def main(event):
         elif resolve(tok):
             add(bound, resolve(tok))
     ev = event.get("hook_event_name")
+    if ev == "Stop":
+        return stop_gate(sid, event)
     if ev == "SessionStart":
         state_file.unlink(missing_ok=True)
     seen = json.loads(state_file.read_text()) if state_file.exists() else {}
+    seen0 = json.dumps(seen, sort_keys=True)
     if ev == "PreToolUse":
         res = pre_tool(event, seen)
         command = (event.get("tool_input") or {}).get("command") or ""
-        for word in ENTER.findall(command if event.get("tool_name") == "Bash" and "<<" not in command else ""):   # 명령이 본문을 출력한다 — 여기선 기록만
+        entering = ENTER.findall(command if event.get("tool_name") == "Bash" and "<<" not in command else "")
+        for word in entering:   # 명령이 본문을 출력한다 — 여기선 기록만
             d = resolve(word)
             if d:
                 seen[str(d)] = digest(render(d))
+                seen["loaded:" + str(d)] = True
                 add(bound, d)
-        targets = [d for p in touched(event) for d in path_projects(p) if str(d) not in seen]
+        inbox = [p for p in touched(event) if event.get("tool_name") in ("Write", "Edit", "MultiEdit") and re.search(r"/_inbox/[^/]+\.md$", p)]
+        if inbox:   # Stop 훅이 반영 여부를 본다 — compact 에도 남게 따로 둔다
+            STATE.mkdir(parents=True, exist_ok=True)
+            with open(STATE / f"{sid}.inbox", "a") as f:
+                f.write("".join(os.path.expanduser(p) + "\n" for p in inbox))
+        targets = [] if entering else list(dict.fromkeys(d for p in touched(event) for d in path_projects(p) if not seen.get("loaded:" + str(d))))
         if targets and not (res and "permissionDecision" in res["hookSpecificOutput"]):
             ctx = (res or {}).get("hookSpecificOutput", {}).get("additionalContext", "")
-            extra = fill(list(dict.fromkeys(targets)), seen, bound, len(ctx),
+            extra = fill(targets, seen, bound, len(ctx),
                          "[project-enter] `--enter` 없이 이 프로젝트의 파일을 건드려 훅이 대신 넣는다. 프로젝트 일을 시작할 땐 먼저 부른다.\n")
-            if extra:
+            missing = [d for d in targets if not seen.get("loaded:" + str(d))]
+            if missing:   # 본문이 한도를 넘어 못 들어갔다 — 부를 때까지 막는다
+                res = {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny",
+                       "permissionDecisionReason": "이 도구 호출은 프로젝트 " + ", ".join(name_of(d) for d in missing) + " 의 파일을 건드리는데, "
+                       "그 프로젝트의 Agent State · Short Term Memory · Document 가 이 세션에 아직 안 들어갔다(한도 초과 또는 compact). 먼저 "
+                       + " ; ".join(f"`{ENTER_CMD} {name_of(d)}`" for d in missing) + " 를 Bash 로 실행해 읽고, 같은 호출을 다시 한다.\n\n"
+                       + "\n".join(titles(d) for d in missing if titles(d))}}
+            elif extra:
                 res = {"hookSpecificOutput": {"hookEventName": "PreToolUse",
                        "additionalContext": "\n\n".join(([ctx] if ctx else []) + extra)}}
     else:
@@ -349,12 +442,11 @@ def main(event):
         else:
             out += fill(targets, seen, bound)
         res = "\n\n".join(x for x in out if x) or None
-    if bound != before or ev == "SessionStart" or res:
+    if bound != before or ev == "SessionStart" or res or json.dumps(seen, sort_keys=True) != seen0:
         STATE.mkdir(parents=True, exist_ok=True)
         state_file.write_text(json.dumps(seen))
         bind_file.write_text("\n".join(bound))
-    if res:
-        print(res if isinstance(res, str) else json.dumps(res, ensure_ascii=False))
+    return res
 
 
 def selftest():
@@ -444,10 +536,15 @@ def selftest():
                                           cwd=str(WORKSPACE)), "프롬프트의 허브 프로젝트 이름을 못 잡음"
         assert "[project ws/docs-x]" in read(hp / "documentation/a.md", session_id="s10", cwd=str(WORKSPACE)), "허브 폴더 안 경로를 못 잡음"
         assert read(HUB / "projects/ws/_registry.md", session_id="s10b", cwd=str(WORKSPACE)) == "", "조직 폴더의 파일을 프로젝트로 봄"
+        (HUB / "projects/ws/_catalog").mkdir(parents=True, exist_ok=True)
+        (HUB / "projects/ws/_catalog/x.json").write_text("{}")
+        assert read(HUB / "projects/ws/_catalog/x.json", session_id="s10c", cwd=str(WORKSPACE)) == "", "조직의 _catalog 폴더를 프로젝트로 봄"
         (HUB / "projects/ws/rules").mkdir(parents=True)
         (HUB / "projects/ws/rules/R001.md").write_text("---\ntitle: 조직 규칙\n---\n본문 조직규칙")
         out = read(WORKSPACE / "docs-x/src/m.py", session_id="s12", cwd=str(WORKSPACE))
         assert "조직 공통 Short Term Memory (ws)" in out and "본문 조직규칙" in out, "조직 규칙 미상속"
+        assert path_projects(WORKSPACE / "alpha/docs/rules/R001.md") == [WORKSPACE / "alpha/docs/rules"], \
+            "경로 속 rules 폴더를 조직 규칙 폴더(허브 프로젝트)로 잡음"
         (tmp / "elsewhere/docs-x").mkdir(parents=True)
         b = dict(session_id="s13", cwd=str(WORKSPACE))
         assert hook(hook_event_name="UserPromptSubmit", prompt="그냥 질문", **b) == "", "묶기 전인데 주입"
@@ -458,8 +555,24 @@ def selftest():
         assert hook(hook_event_name="UserPromptSubmit", prompt="다음", **b) == "", "@- 로 안 풀림"
         assert hook(hook_event_name="UserPromptSubmit", prompt="mail me@docs-x.com", session_id="s14", cwd=str(WORKSPACE)).count("[project ws/docs-x]") <= 1
         (hp / "current_status.md").write_text("# 현재 단계\n" + "가" * 12000)
-        out = read(WORKSPACE / "docs-x/src/m.py", session_id="s15", cwd=str(WORKSPACE))
-        assert "상한 9,000자를 넘어 생략" in out and "가" * 100 not in out and "본문 허브규칙" in out, "넘치는 칸 생략 실패"
+        r = json.loads(hook(hook_event_name="PreToolUse", tool_name="Read", tool_input={"file_path": str(WORKSPACE / "docs-x/src/m.py")},
+                            session_id="s15", cwd=str(WORKSPACE)))["hookSpecificOutput"]
+        assert r.get("permissionDecision") == "deny" and "본문 허브규칙" not in r["permissionDecisionReason"] and "--enter" in r["permissionDecisionReason"], \
+            "훅 1개(--part 없음)인데 한도 넘는 본문을 넣거나 막지 않음"
+        ev = json.dumps(dict(hook_event_name="PreToolUse", tool_name="Read", tool_input={"file_path": str(WORKSPACE / "docs-x/src/m.py")},
+                             session_id="s15b", cwd=str(WORKSPACE)))
+        ps = [subprocess.Popen([sys.executable, __file__, "--part", f"{k}/4"], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                               stderr=subprocess.PIPE, env=env, text=True) for k in (4, 3, 2, 1)]   # 뒤 번호가 먼저 떠도 기다린다
+        for p in ps:   # 훅처럼 모두에게 먼저 입력을 준다
+            p.stdin.write(ev)
+            p.stdin.close()
+        outs = [p.stdout.read() for p in ps][::-1]
+        parts = [json.loads(o)["hookSpecificOutput"]["additionalContext"] for o in outs if o]
+        whole = "".join(parts)
+        assert len(parts) == 3 and all(len(o) <= 10000 for o in outs) and "가" * 9000 in whole and "본문 허브규칙" in whole \
+            and parts[2].startswith("[이어서 3/3]"), "훅 4개(--part k/4)로 나눠 넣기 실패"
+        assert not (STATE / "spool.log").exists(), "조각 기다리다 시간 초과"
+        assert chunks("a" * 25) == ["a" * 25] and [len(c) for c in chunks("a" * 25, 10)] == [10, 10, 5] and chunks("ab\n\ncd", 3) == ["ab", "cd"]
         (hp / "current_status.md").write_text("# 현재 단계: S001 시작\n지금 할 일")
         lg = WORKSPACE / "docs-x/docs/rules"
         lg.mkdir(parents=True)
@@ -507,9 +620,36 @@ def selftest():
         real, render = render, lambda d: f"[project {d.name}] " + "가" * 6000   # 한도 넘는 둘째 프로젝트: 알림 줄은 한 번만
         sn, bd = {}, []
         first = fill([WORKSPACE / "p1", WORKSPACE / "p2"], sn, bd)
-        assert "한도를 넘어 뺐다" in first[1] and "한도를 넘어" not in "".join(fill([WORKSPACE / "p0", WORKSPACE / "p2"], sn, bd)), "한도 초과 줄을 매번 반복"
+        assert "한도를 넘어 뺐다" in first[1] and "한도를 넘어" in "".join(fill([WORKSPACE / "p0", WORKSPACE / "p2"], sn, bd)), \
+            "본문을 못 넣은 프로젝트는 부를 때까지 매번 알려야 함"
+        assert not sn.get("loaded:" + str(WORKSPACE / "p2")), "본문을 못 넣었는데 loaded 로 표시"
         render = real
-    print("selftest OK — cwd 무시 · 파일 경로·Bash 경로 안전망(세션당 1회) · 프로젝트 지도(별칭·단계·쉬는 중, 시작 위치 무관) · --enter(별칭·registry 경로·모르는 이름) · 프롬프트 별칭·조사 · --enter 기록·compact 뒤 마지막 본문 · 자원 카드(명령 주입·세션당 1회·부분 이름 무시·deny 차단·asset-ok 통과·프롬프트 자원 이름) · 이름 언급·본문 세션당 1회·매번 제목·SessionStart 재주입·변경 재주입·밖에서 무주입·부분 이름 무시·triggers·docs-* 루트·하위 깊이 · 허브(조직 계층·조직 규칙 상속·@묶기/compact 유지/@- 풀기·코드 repo 경로·허브 경로·이름 언급·Agent State/STM/Document(뿌리 본문+summary 나무)·나머지 본문과 Archive 제외·자원 카드)")
+        # gate: 본문이 한도를 넘는 프로젝트의 파일은 --enter 전까지 막는다
+        big = WORKSPACE / "big/docs/rules"
+        big.mkdir(parents=True)
+        (big / "R001.md").write_text("---\ntitle: 큰 규칙\n---\n" + "가" * (LIMIT + 500) + "\n")
+        gk = dict(session_id="sg", cwd=str(WORKSPACE))
+        r = json.loads(hook(hook_event_name="PreToolUse", tool_name="Read", tool_input={"file_path": str(WORKSPACE / "big/x.py")}, **gk))
+        assert r["hookSpecificOutput"].get("permissionDecision") == "deny" and "--enter big" in r["hookSpecificOutput"]["permissionDecisionReason"] \
+            and "R001 큰 규칙" in r["hookSpecificOutput"]["permissionDecisionReason"], "한도 넘는 프로젝트 파일을 막지 않음"
+        hook(hook_event_name="PreToolUse", tool_name="Bash", tool_input={"command": f"{ENTER_CMD} big"}, **gk)
+        assert hook(hook_event_name="PreToolUse", tool_name="Read", tool_input={"file_path": str(WORKSPACE / "big/x.py")}, **gk) == "", "--enter 뒤에도 막음"
+        hook(hook_event_name="SessionStart", **gk)
+        r = hook(hook_event_name="PreToolUse", tool_name="Read", tool_input={"file_path": str(WORKSPACE / "big/x.py")}, **gk)
+        assert r and json.loads(r)["hookSpecificOutput"].get("permissionDecision") == "deny", "compact 뒤에는 다시 불러야 함"
+        # Stop: 이 세션이 쓴 inbox 가 남았으면 한 번 막는다
+        ib = WORKSPACE / "alpha/docs/_inbox/2026-01-01-x.md"
+        ib.parent.mkdir(parents=True, exist_ok=True)
+        ib.write_text("사실")
+        sk = dict(session_id="ss", cwd=str(WORKSPACE))
+        hook(hook_event_name="PreToolUse", tool_name="Write", tool_input={"file_path": str(ib), "content": "사실"}, **sk)
+        r = hook(hook_event_name="Stop", **sk)
+        assert r and json.loads(r)["decision"] == "block" and str(ib) in json.loads(r)["reason"], "반영 안 된 inbox 로 끝내는 것을 막지 않음"
+        assert hook(hook_event_name="Stop", **sk) == "", "같은 inbox 로 두 번 막음"
+        assert hook(hook_event_name="Stop", session_id="other", cwd=str(WORKSPACE)) == "", "다른 세션의 inbox 로 막음"
+        ib.unlink()
+        assert hook(hook_event_name="Stop", session_id="ss2", cwd=str(WORKSPACE)) == ""
+    print("selftest OK — cwd 무시 · 파일 경로·Bash 경로 안전망(세션당 1회) · 프로젝트 지도(별칭·단계·쉬는 중, 시작 위치 무관) · --enter(별칭·registry 경로·모르는 이름) · 프롬프트 별칭·조사 · --enter 기록·compact 뒤 마지막 본문 · 자원 카드(명령 주입·세션당 1회·부분 이름 무시·deny 차단·asset-ok 통과·프롬프트 자원 이름) · 이름 언급·본문 세션당 1회·매번 제목·SessionStart 재주입·변경 재주입·밖에서 무주입·부분 이름 무시·triggers·docs-* 루트·하위 깊이 · 허브(조직 계층·조직 규칙 상속·@묶기/compact 유지/@- 풀기·코드 repo 경로·허브 경로·이름 언급·Agent State/STM/Document(뿌리 본문+summary 나무)·나머지 본문과 Archive 제외·자원 카드) · 불러오기 강제(한도 초과 본문은 --enter 전까지 도구 차단, compact 뒤 다시) · Stop 시 반영 안 된 inbox 1회 차단")
 
 
 if __name__ == "__main__":
@@ -530,6 +670,7 @@ if __name__ == "__main__":
         print(project_map())
     else:
         try:
-            main(json.load(sys.stdin))
+            k, PARTS = map(int, (sys.argv[sys.argv.index("--part") + 1] if "--part" in sys.argv else "1/1").split("/"))
+            emit(sys.stdin.read(), k, PARTS)
         except Exception as e:   # a hook must never block the prompt
             print(f"[project-rules] hook error: {e}", file=sys.stderr)
