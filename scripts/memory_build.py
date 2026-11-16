@@ -230,7 +230,8 @@ HUB_ORG = {"INTERX": "interx", "workspace": "personal", "SapiensQ": "sapiensq"} 
 
 
 def select(query, org=None, store=None):
-    """프로젝트의 rules/_ltm.md = 저장된 질의(frontmatter `area` · 선택 `type`) -> 그 프로젝트 주입에 넣을 메모 글 [(이름, 글)].
+    """프로젝트의 rules/_ltm.md = 저장된 질의(frontmatter `area` · 선택 `type` · `project` · `org_only`) -> 그 프로젝트 주입에 넣을 메모 글 [(이름, 글)].
+    `area` 를 비우면 태그로 고르지 않고 `project:` 메모 전부, 또는 `org_only: true` 면 그 조직(`org:`) 공통 메모 전부를 고른다.
     area 가 하나라도 맞고(계층 태그는 상위로도 맞음) type 이 맞으며 org 가 비었거나 같은 메모. 필수 메모는 이미 늘 들어가서 뺀다.
     글 = <!-- core --> 부분, 없으면 description + 경로(본문은 길어서 넣지 않는다)"""
     q = fm(query)
@@ -243,8 +244,13 @@ def select(query, org=None, store=None):
             continue
         if f.get("project") and f["project"].casefold() != (q.get("project") or "").casefold():
             continue   # 프로젝트 메모는 질의가 같은 project: 이름(메모 쪽 표기, 예 DFlash)을 적었을 때만
-        if not want & {x for a in areas for x in (a, a.split("/")[0])}:
-            continue
+        if want:
+            if not want & {x for a in areas for x in (a, a.split("/")[0])}:
+                continue
+            if q.get("org_only") and f.get("org") != org:
+                continue
+        elif not ((q.get("project") and f.get("project")) or (q.get("org_only") and f.get("org") == org and org)):
+            continue   # area 없는 질의 = 그 project 메모 전부, 또는 org_only 면 그 조직 공통 메모 전부(태그 없이 전부 끌어오지 않게)
         m = re.search(r"<!-- core -->\n?(.*?)<!-- /core -->", p.read_text(encoding="utf-8"), re.S)
         out.append((p.stem, m.group(1).strip() if m else f"{f.get('description', '')} — `{p}`"))
     return out
@@ -272,7 +278,8 @@ def lint(store=None):
         for h in TYPES.get(f.get("type"), ()):
             if f"**{h}" not in body: add(f"소제목 **{h}:** 없음 ({f.get('type')} 틀)")
         if f.get("type") == "feedback" and len(re.findall(r"^\d+\. ", body, re.M)) > 7: add("절차 7단계 초과(스킬로 올릴 후보)")
-        if JOURNAL.search(body): add("날짜 일지 문단(→ **사례:** 목록 한 줄로)")
+        if JOURNAL.search(body): add("날짜 일지 문단(→ 규칙 자체를 고친다)")
+        if f.get("type") == "feedback" and "**사례:**" in body: add("사례 칸은 쓰지 않음(규칙 자체를 고친다)")
         core = re.search(r"<!-- core -->\n?(.*?)<!-- /core -->", body, re.S)
         if core:   # 짧은 판(core)과 전체(본문)를 나눠 짧게 써도 빠지지 않게 — templates/memory/README.md
             c = core.group(1).strip()
@@ -283,8 +290,7 @@ def lint(store=None):
         if f.get("type") == "feedback":
             why = re.search(r"\*\*Why:\*\*(.*?)(?=\n\*\*[^*\n]+:\*\*|\Z)", body, re.S)
             w = why.group(1).strip() if why else ""
-            if why and len(w) < 10: add("Why 비어 있음(날짜와 근거 한 줄)")
-            elif why and not re.search(r"\d{4}-\d{2}-\d{2}|\d{1,2}/\d{1,2}", w): add("Why 에 날짜 없음")
+            if why and len(w) < 10: add("Why 비어 있음(이 규칙의 이유)")
         for a in areas_of(f) if tags is not None else ():
             if a in alias: add(f"태그 동의어 '{a}' (→ {alias[a]})")
             elif a not in tags and a.split("/")[0] not in tags: add(f"태그 목록에 없음 '{a}' (_tags.md 에 한 줄 더하거나 있는 태그로)")
@@ -421,12 +427,12 @@ def selftest():
         sync_views(st, vw)
         assert "가" * TITLE_MAX + "…](long.md)" in (vw["a"] / "MEMORY.md").read_text(), "긴 제목이 잘리지 않음"
         (st / "good.md").write_text("---\nname: good\ndescription: d\ntype: feedback\narea: 일하는 방식\nupdated: 2026-10-26\n---\n"
-                                    "**목적:** x\n**언제:** y\n**절차:**\n1. a → b\n**Why:** 2026-09-04 사용자 \"이렇게 해\"\n**사례:**\n- 2026-09-04 일\n")
-        (st / "bad.md").write_text("---\nname: 다른이름\ndescription: d\ntype: feedback\nindex: i\n---\n규칙.\n\n2026-09-04 추가: 또 생김\n")
+                                    "**목적:** x\n**언제:** y\n**절차:**\n1. a → b\n**Why:** 근거가 남아야 경계를 판단한다\n")
+        (st / "bad.md").write_text("---\nname: 다른이름\ndescription: d\ntype: feedback\nindex: i\n---\n규칙.\n\n2026-09-04 추가: 또 생김\n**사례:**\n- 2026-09-04 일\n")
         L = lint(st)
         assert not [m for f_, m in L if f_ == "good.md"], [m for f_, m in L if f_ == "good.md"]
         bad = {m for f_, m in L if f_ == "bad.md"}
-        for need in ("name ≠ 파일 이름", "area 없음", "index 칸은 쓰지 않음", "소제목 **목적:** 없음 (feedback 틀)", "날짜 일지 문단(→ **사례:** 목록 한 줄로)"):
+        for need in ("name ≠ 파일 이름", "area 없음", "index 칸은 쓰지 않음", "소제목 **목적:** 없음 (feedback 틀)", "날짜 일지 문단(→ 규칙 자체를 고친다)", "사례 칸은 쓰지 않음(규칙 자체를 고친다)"):
             assert need in bad, (need, bad)
         (st / "fb.md").write_text("---\nname: fb\ndescription: d\ntype: feedback\narea: 일하는 방식\nupdated: 2026-10-26\n---\n<!-- core -->\n늘 검증한다\n<!-- /core -->\n**목적:** x\n**언제:** y\n**절차:**\n1. z\n**Why:** 이유만 있고 날짜는 없음\n")
         (st / "fb2.md").write_text("---\nname: fb2\ndescription: d\ntype: feedback\narea: 일하는 방식\nupdated: 2026-10-26\n---\n<!-- core -->\n보고 전 → 검증한다\n<!-- /core -->\n**목적:** x\n**언제:** y\n**절차:**\n1. z\n**Why:**\n**사례:**\n")
@@ -434,8 +440,8 @@ def selftest():
         (st / "ok.md").write_text("---\nname: ok\ndescription: d\ntype: feedback\narea: 일하는 방식\nupdated: 2026-10-26\n---\n<!-- core -->\n보고 전 → 검증한다\n<!-- /core -->\n**목적:** x\n**언제:** y\n**절차:**\n1. z\n**Why:** 2026-10-26 사용자 \"검증해\"\n")
         L = {}
         for f_, m_ in lint(st): L.setdefault(f_, []).append(m_)
-        assert "core 에 '<언제> → <무엇>' 형식 없음" in L.get("fb.md", []) and "Why 에 날짜 없음" in L.get("fb.md", []), L.get("fb.md")
-        assert "Why 비어 있음(날짜와 근거 한 줄)" in L.get("fb2.md", []) and not any("core" in x for x in L.get("fb2.md", [])), L.get("fb2.md")
+        assert "core 에 '<언제> → <무엇>' 형식 없음" in L.get("fb.md", []) and not any("Why" in x for x in L.get("fb.md", [])), L.get("fb.md")
+        assert "Why 비어 있음(이 규칙의 이유)" in L.get("fb2.md", []) and not any("core" in x for x in L.get("fb2.md", [])), L.get("fb2.md")
         assert "core 는 '- 키: 값' 줄만" in L.get("rf.md", []) and "ok.md" not in L, (L.get("rf.md"), L.get("ok.md"))
         for n in ("fb", "fb2", "rf", "ok"): (st / f"{n}.md").unlink()
         (st / "good.md").unlink(); (st / "bad.md").unlink()
@@ -460,6 +466,13 @@ def selftest():
         assert "s6" not in dict(select(m / "q.md", "personal", st)), "다른 프로젝트 메모가 샘"
         (m / "q2.md").write_text("---\narea: 실험과 데이터\ntype: feedback\nproject: dflash\n---\n")
         assert "s6" in dict(select(m / "q2.md", "personal", st)), "같은 project 이름(대소문자 무시) 메모가 빠짐"
+        (m / "q3.md").write_text("---\nproject: dflash\n---\n")
+        assert set(dict(select(m / "q3.md", "personal", st))) == {"s6"}, "area 없는 project 질의 = 그 프로젝트 메모 전부여야 함"
+        (m / "q4.md").write_text("---\norg_only: true\n---\n")
+        assert set(dict(select(m / "q4.md", "interx", st))) == {"s4"}, "org_only = 그 조직 공통 메모 전부(프로젝트 메모·org 없는 메모 제외)"
+        assert set(dict(select(m / "q4.md", "personal", st))) == set(), "org_only 가 다른 조직 메모를 고름"
+        (m / "q5.md").write_text("---\n---\n")
+        assert dict(select(m / "q5.md", "interx", st)) == {}, "빈 질의가 메모를 전부 끌어옴"
         (st / "s6.md").unlink()
         set_fm(st / "s1.md", "status", "archived")
         assert "s1" not in dict(select(m / "q.md", "personal", st)), "보관 메모가 프로젝트 고르기에 들어감"

@@ -67,7 +67,8 @@ python3 ~/.claude/skills/docs-pattern/scripts/docs_build.py --selftest      # �
 ```
 
 - **FAIL (exit 1)**: 깨진 링크 · ID 중복 · 파일 이름 형식 · title/status 누락·오류 · active 단계 ≠ 1 ·
-  부모 문서 없음 · history 없음/날짜 없음/역순 · 페이지 없는 history · (`--check`) 생성물이 최신 아님
+  부모 문서 없음 · history 없음/날짜 없음/역순 · 페이지 없는 history · (`--check`) 생성물이 최신 아님 ·
+  뺀 개념 장부 `rules/_retired.md`(표 `| 용어 | 뺀 날 | 근거 | 대신 | 남아도 되는 페이지 |`)의 용어가 지금 참인 페이지(Document · R### · active 단계)에 남음
 - **WARN**: 어느 페이지도 링크하지 않는 이슈 · 처리 안 된 `_inbox/`
 - 같은 입력 → 바이트 동일 출력(시각 도장 없음). 생성물을 손으로 고치면 `--check` 가 잡는다.
 
@@ -80,6 +81,7 @@ python3 ~/.claude/skills/docs-pattern/scripts/docs_build.py --selftest      # �
 | 3 | 컴파일러 | `--check` exit 0 = 구조 판정 (결정론) |
 | 4 | 오케스트레이터 | 워커가 쓴 문장이 inbox 사실과 맞는지만 판정 (verdict). 틀리면 inbox 에 정정 사실을 추가해 다시 워커 |
 
+- **개념 · 기능을 빼는 결정**은 같은 inbox 에 장부 행(`rules/_retired.md`)을 함께 적는다. 워커가 행을 더하면 `docs_build` 가 그 말이 남은 페이지를 모두 가리킨다 — 정의 페이지만 고치고 다른 페이지 · Agent State 에 옛 말이 남는 오염을 막는다.
 - inbox 가 있어서 "입력이 세션 서사라 위임 불가"(worker-delegation §0) 문제가 풀린다 — 서사는 사실 몇 줄로
   저장소에 들어가고, 배치·문장·이력·검사 통과는 워커 몫이다.
 - 트리거: 세션 종료·핸드오프("compact 준비"), 이슈 발견/해결, 단계 전환, 개념 변경. 작은 변경도 같은 흐름.
