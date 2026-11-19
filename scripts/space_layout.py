@@ -56,6 +56,8 @@ def repl(text, pairs):
     """옛 경로 → 새 경로. 이름 경계: 뒤에 [A-Za-z0-9_-] 나 "."+[A-Za-z0-9] 가 이어지면 다른 이름이다"""
     if not pairs:
         return text, 0
+    home = str(Path.home()).rstrip("/")   # 메모 · 등록표는 ~/ 로 적는다 — 홈 아래 경로면 그 형태도 같이 바꾼다
+    pairs = list(pairs) + [("~" + o[len(home):], "~" + n[len(home):]) for o, n in pairs if home and under(o, home) and under(n, home) and o != home]
     d = dict(pairs)
     alt = "|".join(re.escape(o) for o, _ in sorted(pairs, key=lambda x: -len(x[0])))
     rx = re.compile(r"(?<![A-Za-z0-9_.-])(" + alt + r")(?![A-Za-z0-9_-])(?!\.[A-Za-z0-9])")
@@ -97,8 +99,9 @@ def registry_rows(hub, org):
     return read_registry(Path(hub).expanduser() / "projects" / org)
 
 
-def scan(org, rules, hub):
+def scan(org, rules, hub, dissolve=()):
     root, tags = load_rules(rules, org)
+    dissolve = [Path(d) if os.path.isabs(d) else root / d for d in dissolve]
     by_key = {}
     for r in registry_rows(hub, org):
         for k in r["keys"]:
@@ -123,15 +126,30 @@ def scan(org, rules, hub):
             elif depth == 1 and e.name in groups.get(d.name, ()):
                 inside(e, 2)
 
-    for e in kids(root) if root.is_dir() else []:
+    def top(e):   # 루트 바로 아래 항목(해체 폴더 안 항목도 같다): 열쇠 있으면 대상, 분류 폴더면 안으로, 그 밖은 모름
         if not e.is_dir():
             unknown.append(e)
-            continue
+            return
         k = key_of(e)
         if k or e.name not in tagdirs:
             found.append((e, k))
         else:
             inside(e, 1)
+
+    later = []   # 해체 폴더 자신은 안쪽 항목이 다 나간 뒤 맨 마지막에 옮긴다
+    for e in kids(root) if root.is_dir() else []:
+        if e in dissolve:
+            continue
+        top(e)
+    for d in dissolve:
+        if not d.is_dir():
+            continue
+        for e in kids(d):
+            top(e)
+        if key_of(d):
+            later.append((d, key_of(d)))
+    lp = {p for p, _ in later}
+    found = [x for x in found if x[0] not in lp] + later   # 해체 폴더가 분류 폴더 안이면 일반 스캔에도 잡힌다 — 한 번만, 맨 뒤
     move, ok = [], []
     for p, k in found:
         row = by_key.get(k) if k else None
@@ -276,9 +294,9 @@ def impacts(pairs, moves, o):
             "crontab": cron, "claude_history": claude, "text": text}
 
 
-def make_plan(moves, root, org, o):
+def make_plan(moves, root, org, o, unknown=()):
     pairs = [(m["from"], m["to"]) for m in moves]
-    return {"org": org, "root": str(root), "moves": moves, "impacts": impacts(pairs, moves, o)}
+    return {"org": org, "root": str(root), "moves": moves, "unknown": list(unknown), "impacts": impacts(pairs, moves, o)}
 
 
 # ───────────────────────── apply ─────────────────────────
@@ -392,7 +410,7 @@ def reverse_moves(mapf):
         if "\t" in line:
             old, parent = line.split("\t", 1)
             mv.append({"from": str(root / parent / Path(old).name), "to": str(root / old), "space": ""})
-    return root, mv
+    return root, mv[::-1]   # 거꾸로: 우산 폴더가 먼저 제자리에 돌아와야 안쪽 항목이 들어간다
 
 
 # ───────────────────────── CLI ─────────────────────────
@@ -419,7 +437,7 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     s = sub.add_parser("scan", parents=[c]); s.add_argument("org"); s.add_argument("--json", action="store_true")
-    s = sub.add_parser("plan", parents=[c]); s.add_argument("org"); s.add_argument("--out")
+    s = sub.add_parser("plan", parents=[c]); s.add_argument("org"); s.add_argument("--out"); s.add_argument("--dissolve", action="append", default=[])
     s = sub.add_parser("apply", parents=[c]); s.add_argument("plan", nargs="?"); s.add_argument("--reverse"); s.add_argument("--yes", action="store_true")
     s = sub.add_parser("hook", parents=[c]); s.add_argument("org", nargs="?")
     a = ap.parse_args(argv)
@@ -452,9 +470,9 @@ def main(argv=None):
                 print(f"  모름 {u}")
         return 0
     if a.cmd == "plan":
-        res = scan(a.org, o["rules"], o["hub"])
+        res = scan(a.org, o["rules"], o["hub"], a.dissolve)
         write_cache(a.org, res, o["cache_dir"])
-        plan = make_plan(res["move"], res["root"], a.org, o)
+        plan = make_plan(res["move"], res["root"], a.org, o, res["unknown"])
         text = json.dumps(plan, ensure_ascii=False, indent=1)
         if a.out:
             Path(a.out).write_text(text, encoding="utf-8")
@@ -569,6 +587,33 @@ def selftest():
                 "| kb | active | — | — | 지식 | `git:g/kb` | kb |\n", encoding="utf-8")
             res = json.loads(_run("scan", "ORG", "--json", *c)[1])
             assert {m["from"]: m["to"] for m in res["move"]}.get(str(R / "kb")) == str(R / "solution/kb/kb"), "절 태그를 못 읽음"
+            # 해체: 우산 폴더 안 항목은 각자 제자리로, 우산 폴더는 맨 마지막, 열쇠 없는 안쪽 항목은 모름
+            R, c = _world(td / "g")
+            (td / "g/hub/projects/ORG/_registry.md").write_text((td / "g/hub/projects/ORG/_registry.md").read_text() + "| old | archived | `space:old` | tools | — | — | 우산 |\n", encoding="utf-8")
+            (R / "old/tool2").mkdir(parents=True); (R / "old/.space").write_text("old\n"); (R / "old/tool2/.space").write_text("tool\n"); (R / "old/misc").mkdir()
+            _run("plan", "ORG", "--dissolve", "old", "--out", str(td / "g/plan.json"), *c)
+            pl = json.loads((td / "g/plan.json").read_text())
+            assert pl["moves"][-1]["from"] == str(R / "old") and any(m["from"] == str(R / "old/tool2") for m in pl["moves"][:-1]), "해체 순서가 틀림"
+            assert _run("apply", str(td / "g/plan.json"), "--yes", *c)[0] == 0 and (R / "tools/old/misc").is_dir() and (R / "tools/tool2/.space").exists() and not (R / "old").exists(), "해체 apply 실패"
+            # 해체 폴더가 분류 폴더 안에 있어도 그 이동은 한 번, 맨 마지막
+            R, c = _world(td / "h")
+            rg = td / "h/hub/projects/ORG/_registry.md"
+            rg.write_text(rg.read_text() + "| old | archived | `space:old` | solution | — | — | 우산 |\n", encoding="utf-8")
+            (R / "tools/old/tool2").mkdir(parents=True); (R / "tools/old/.space").write_text("old\n"); (R / "tools/old/tool2/.space").write_text("tool\n")
+            _run("plan", "ORG", "--dissolve", "tools/old", "--out", str(td / "h/plan.json"), *c)
+            fr = [m["from"] for m in json.loads((td / "h/plan.json").read_text())["moves"]]
+            assert len(fr) == len(set(fr)) and fr[-1] == str(R / "tools/old"), "분류 폴더 안 해체 폴더가 중복 · 순서 틀림"
+            # 홈 아래 경로는 ~/ 로 적힌 것도 바꾼다 (이름 경계 포함)
+            old_home = os.environ.get("HOME")
+            os.environ["HOME"] = str(td)
+            try:
+                t, n = repl(f"`~/w/kb` ~/w/kbx {td}/w/kb", [(f"{td}/w/kb", f"{td}/w/s/kb")])
+                assert t == f"`~/w/s/kb` ~/w/kbx {td}/w/s/kb" and n == 2, t
+            finally:
+                if old_home is None:
+                    os.environ.pop("HOME", None)
+                else:
+                    os.environ["HOME"] = old_home
             # 결함 3: 상대 경로로 부른 worktree repair → 이어지지 않아 apply 가 실패해야 한다
             R, c = _world(td / "d")
             _run("plan", "ORG", "--out", str(td / "d/plan.json"), *c)

@@ -183,6 +183,7 @@ python3 scripts/space_layout.py apply --reverse <root>/.layout/<날짜>-map.tsv 
 python3 scripts/space_layout.py hook  ORG                  # 어긋남이 있을 때 한 줄 알림만 (옮기지 않는다)
 ```
 
+- 우산 폴더 풀기: `plan ORG --dissolve <폴더>`(반복 가능, 루트 기준 상대·절대 경로) — 폴더 안 항목을 루트 바로 아래 항목처럼 훑어 각자 제자리로 보내고(열쇠 없는 것은 모름으로 안에 남음), 폴더 자신이 Space 면 맨 마지막에 옮긴다.
 - 열쇠: git 폴더 = `git:<원격 주소의 경로>`, 그 밖 = 폴더 안 `.space` 첫 줄 `space:<이름>`. 열쇠가 없거나 등록표에 없으면 "모름"이고 옮기지 않는다.
 - 목적지 = `<root>/<태그 폴더>/<묶음>/<폴더 이름>`. apply 는 사전 점검(원본 존재 · 목적지 비어 있음)이 걸리면 아무것도 옮기지 않는다.
 - **메모 · 문서에는 절대 경로가 아니라 Space 이름**을 쓴다. 코드 repo 의 위치는 `space_layout.locate(이름, org)`(scan 캐시)로 찾는다 — 경로를 적어 두면 다음 배치 정리 때 깨진다.

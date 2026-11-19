@@ -238,3 +238,67 @@ def test_non_space_entries_inside_tag_dirs_are_not_counted(world):
 def test_hook_without_org_covers_every_org_in_rules(world):
     line = run(world, "hook").stdout.strip()
     assert line.startswith("[layout] ORG:") and "옮길 것 3" in line and "모름 2" in line
+
+
+def test_dissolve_umbrella_folder(world):
+    """plan --dissolve <폴더>: 우산 폴더 안의 항목을 루트 바로 아래 항목처럼 훑어 각자 제자리로 보내고, 우산 폴더 자신은 맨 마지막에 옮긴다.
+    열쇠 없는 안쪽 항목은 모름으로 알리고 우산 폴더와 함께 간다."""
+    R, H = world["R"], world["H"]
+    reg = H / "projects/ORG/_registry.md"
+    reg.write_text(reg.read_text(encoding="utf-8") + "| old | archived | `git:g/old` | tools | — | — | 옛 우산 |\n", encoding="utf-8")
+    old = R / "old"; old.mkdir()
+    git("init", "-q", cwd=old); git("remote", "add", "origin", "http://h/g/old.git", cwd=old)
+    (old / "exp2").mkdir(); git("init", "-q", cwd=old / "exp2"); git("remote", "add", "origin", "git@h:g/exp.git", cwd=old / "exp2")
+    sub = old / "sub"; sub.mkdir()
+    git("init", "-q", "-b", "main", cwd=sub); (sub / "a.txt").write_text("a"); git("add", ".", cwd=sub); git("commit", "-qm", "a", cwd=sub)
+    git("remote", "add", "origin", "http://h/g/kb.git", cwd=sub)
+    git("worktree", "add", "-q", "-b", "w2", str(old / "sub-wt"), cwd=sub)
+    (old / "misc").mkdir(); (old / "misc/n.txt").write_text("n"); (old / "f.txt").write_text("f")
+    pf = world["tmp"] / "plan.json"
+    run(world, "plan", "ORG", "--dissolve", "old", "--out", str(pf))
+    p = json.loads(pf.read_text())
+    mv = {m["from"]: m["to"] for m in p["moves"]}
+    assert mv[str(old / "exp2")] == str(R / "research/exp/exp2")
+    assert mv[str(old / "sub")] == str(R / "solution/kb/sub") and mv[str(old / "sub-wt")] == str(R / "solution/kb/sub-wt")
+    assert p["moves"][-1]["from"] == str(old) and p["moves"][-1]["to"] == str(R / "tools/old")
+    assert {str(old / "misc"), str(old / "f.txt")} <= set(p["unknown"])
+    run(world, "apply", str(pf), "--yes")
+    st = subprocess.run(["git", "-C", str(R / "solution/kb/sub-wt"), "status", "-sb"], capture_output=True, text=True)
+    assert st.returncode == 0 and st.stdout.startswith("## w2")
+    assert (R / "research/exp/exp2/.git").exists() and (R / "tools/old/misc/n.txt").exists() and (R / "tools/old/.git").exists()
+    assert not old.exists()
+
+
+def test_dissolve_inside_tag_dir_moves_umbrella_once(world):
+    """분류 폴더 안에 있는 우산 폴더를 풀 때도 우산 폴더의 이동은 한 번(맨 마지막)만 계획한다."""
+    R, H = world["R"], world["H"]
+    reg = H / "projects/ORG/_registry.md"
+    reg.write_text(reg.read_text(encoding="utf-8") + "| old | archived | `git:g/old` | research | — | — | 옛 우산 |\n", encoding="utf-8")
+    old = R / "solution/kb/old"; old.mkdir(parents=True)
+    git("init", "-q", cwd=old); git("remote", "add", "origin", "http://h/g/old.git", cwd=old)
+    (old / "exp2").mkdir(); git("init", "-q", cwd=old / "exp2"); git("remote", "add", "origin", "git@h:g/exp.git", cwd=old / "exp2")
+    pf = world["tmp"] / "plan.json"
+    run(world, "plan", "ORG", "--dissolve", "solution/kb/old", "--out", str(pf))
+    p = json.loads(pf.read_text())
+    froms = [m["from"] for m in p["moves"]]
+    assert len(froms) == len(set(froms)), froms
+    assert froms[-1] == str(old) and p["moves"][-1]["to"] == str(R / "research/old")
+    run(world, "apply", str(pf), "--yes")
+    assert (R / "research/exp/exp2/.git").exists() and (R / "research/old/.git").exists()
+
+
+def test_text_paths_written_with_tilde_are_rewritten(world, monkeypatch):
+    """메모 · 등록표는 경로를 ~/ 로 적는다. 홈 아래 루트라면 ~/ 형태도 찾아 바꾼다."""
+    R = world["R"]
+    home = world["tmp"]
+    note = world["text"] / "tilde.md"
+    note.write_text(f"작업 폴더는 `~/{R.relative_to(home)}/kb` 다.\n")
+    env = {**world["env"], "HOME": str(home)}
+    pf = world["tmp"] / "plan.json"
+    p = subprocess.run([sys.executable, str(SCRIPT), "plan", "ORG", "--out", str(pf), *world["common"]], capture_output=True, text=True, env=env)
+    assert p.returncode == 0, p.stdout + p.stderr
+    plan = json.loads(pf.read_text())
+    assert str(note) in [t["file"] for t in plan["impacts"]["text"]]
+    a = subprocess.run([sys.executable, str(SCRIPT), "apply", str(pf), "--yes", *world["common"]], capture_output=True, text=True, env=env)
+    assert a.returncode == 0, a.stdout + a.stderr
+    assert f"~/{R.relative_to(home)}/solution/kb/kb" in note.read_text()
