@@ -161,6 +161,9 @@ def resolve(word):
             if hub_by_name(r["name"]):
                 return hub_by_name(r["name"])
             found = path_projects(r["path"]) if r["path"].startswith(("~", "/")) else []
+            if not found and r.get("keys"):   # 경로 칸 대신 열쇠: 코드 repo 위치는 space_layout scan 캐시에서
+                import space_layout
+                found = next((f for f in (path_projects(p) for p in space_layout.locate(r["name"], r["org"])) if f), [])
             return found[0] if found else None
     return next((d for d in all_rule_dirs() if name_of(d).lower() == w), None)
 

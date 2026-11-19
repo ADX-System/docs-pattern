@@ -167,14 +167,23 @@ def stores_of(proj):
 
 
 def read_registry(org):
-    """projects/<조직>/_registry.md 의 표 -> [{name, status, path, docs, note}]"""
+    """projects/<조직>/_registry.md 의 표 -> [{name, status, path, docs, note, keys, tags, group}] (칸은 머리 행 이름으로 읽는다)"""
     f = org / "_registry.md"
-    out = []
+    out, cols, section = [], ["프로젝트", "status", "경로", "docs", "메모"], ""   # 머리 행이 없으면 옛 5칸
     for line in (f.read_text(encoding="utf-8").splitlines() if f.exists() else []):
+        h = re.match(r"^## (\S+)(?: — (.+))?$", line)   # DIP 묶음 Space 와 같은 절 머리글
+        if h:
+            section = h.group(1)
+            continue
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) >= 3 and cells[1] in ("active", "paused", "archived"):
-            out.append({"name": cells[0], "status": cells[1], "path": cells[2].strip("`"),
-                        "docs": cells[3] if len(cells) > 3 else "", "note": cells[4] if len(cells) > 4 else ""})
+        if cells and cells[0] == "프로젝트":
+            cols = cells
+        elif len(cells) >= 3 and cells[1] in ("active", "paused", "archived"):
+            g = lambda k: cells[cols.index(k)] if k in cols and cols.index(k) < len(cells) else ""
+            dash = lambda v: "" if v in ("—", "-") else v
+            out.append({"name": cells[0], "status": cells[1], "path": dash(g("경로").strip("`")), "docs": g("docs"), "note": g("메모"),
+                        "keys": re.findall(r"`([^`]+)`", g("열쇠")), "tags": [t for t in re.split(r"[,\s]+", dash(g("태그"))) if t] if "태그" in cols else ([section] if section else []),
+                        "group": dash(g("묶음"))})
     return out
 
 

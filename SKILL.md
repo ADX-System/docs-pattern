@@ -171,6 +171,23 @@ python3 ~/.claude/skills/docs-pattern/scripts/container_build.py --selftest
 - 컨테이너 = `PROJECTS.md` 가 있는 폴더(처음 한 번 실행이 선언). 프로젝트 = 하위 폴더 중 `.git` 또는 `docs/` 가 있는 것.
 - 사람이 쓰는 파일은 `LEGACY.md` 하나: `- <이름> — <remote> — <보관일>`. 자세한 설명은 `docs/documentation/container.md`.
 
+## 폴더 배치 (space_layout.py)
+
+개념(등록표 `_registry.md` 의 열쇠 · 태그 · 묶음 칸) → 폴더, **한 방향**으로만 맞춘다. 폴더 위치를 개념 쪽에 저장하지 않는다. 기계별 규칙 = `~/.config/space-layout/layout.toml`(`[ORG] root` · `[ORG.tags]` 태그→폴더).
+
+```
+python3 scripts/space_layout.py scan  ORG [--json]        # 제자리 · 옮길 것 · 모름 + 위치 캐시 갱신
+python3 scripts/space_layout.py plan  ORG --out plan.json  # 옮길 목록 + 영향(worktree · 컨테이너 · 링크 · crontab · 대화 기록 · 글 속 경로)
+python3 scripts/space_layout.py apply plan.json --yes      # 사람이 plan 을 읽고 승인한 뒤에만
+python3 scripts/space_layout.py apply --reverse <root>/.layout/<날짜>-map.tsv --yes
+python3 scripts/space_layout.py hook  ORG                  # 어긋남이 있을 때 한 줄 알림만 (옮기지 않는다)
+```
+
+- 열쇠: git 폴더 = `git:<원격 주소의 경로>`, 그 밖 = 폴더 안 `.space` 첫 줄 `space:<이름>`. 열쇠가 없거나 등록표에 없으면 "모름"이고 옮기지 않는다.
+- 목적지 = `<root>/<태그 폴더>/<묶음>/<폴더 이름>`. apply 는 사전 점검(원본 존재 · 목적지 비어 있음)이 걸리면 아무것도 옮기지 않는다.
+- **메모 · 문서에는 절대 경로가 아니라 Space 이름**을 쓴다. 코드 repo 의 위치는 `space_layout.locate(이름, org)`(scan 캐시)로 찾는다 — 경로를 적어 두면 다음 배치 정리 때 깨진다.
+- 이 도구가 만든 plan · 명령은 사람이 검토하고 시험한 뒤 실제 폴더에 적용한다.
+
 ## 안티패턴
 
 | 하지 말 것 | 대신 |
